@@ -755,14 +755,8 @@ async def deepwiki_warm_repo(
 # SERVER LIFECYCLE
 # =============================================================================
 
-@mcp.on_shutdown
-async def cleanup():
-    """Clean up resources on server shutdown."""
-    global _client
-    if _client:
-        await _client.close()
-        _client = None
-    logger.info("DeepWiki MCP server shut down cleanly")
+# Note: FastMCP doesn't have on_shutdown hook
+# Cleanup is handled automatically by DeepWikiClient context manager
 
 
 # =============================================================================
