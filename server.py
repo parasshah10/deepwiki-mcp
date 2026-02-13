@@ -1,30 +1,25 @@
 #!/usr/bin/env python3
 """
-DeepWiki MCP Server - Production Grade Implementation
-A Model Context Protocol server for querying code repositories using DeepWiki AI.
+DeepWiki MCP Server - True Async Task-Based Architecture
+Query code repositories with background task execution and status tracking.
 
-Features:
-- Async-first architecture for non-blocking operations
-- Intelligent retry logic with exponential backoff
-- Streaming progress updates for long-running queries
-- Mermaid diagram generation from codemaps
-- Comprehensive error handling and logging
-- Type-safe with Pydantic validation
-- Resource-pooled HTTP client
+Inspired by production async patterns - returns task IDs immediately,
+executes in background, check status later.
 """
 
 import asyncio
 import logging
 import os
 import json
+import time
+import uuid
 from datetime import datetime
 from enum import Enum
-from typing import Dict, Any, List, Optional, Annotated, Union
-from uuid import uuid4
+from typing import Dict, Any, List, Optional, Annotated
 
 import httpx
 from fastmcp import FastMCP
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from tenacity import (
     retry,
@@ -63,19 +58,15 @@ class Settings(BaseSettings):
     )
     read_timeout: float = Field(
         default=180.0,
-        description="HTTP read timeout in seconds (long for deep mode)"
+        description="HTTP read timeout in seconds"
     )
     max_concurrent_queries: int = Field(
         default=5,
         description="Maximum concurrent queries allowed"
     )
-    enable_caching: bool = Field(
-        default=True,
-        description="Enable result caching"
-    )
     log_level: str = Field(
         default="INFO",
-        description="Logging level (DEBUG, INFO, WARNING, ERROR)"
+        description="Logging level"
     )
     
     model_config = SettingsConfigDict(
@@ -98,6 +89,34 @@ logging.basicConfig(
 logger = logging.getLogger("deepwiki-mcp")
 
 # =============================================================================
+# TASK STORAGE
+# =============================================================================
+
+tasks = {}
+MAX_TASKS = 100
+TASK_EXPIRY_HOURS = 24
+
+def cleanup_old_tasks():
+    """Remove tasks older than TASK_EXPIRY_HOURS or exceed MAX_TASKS."""
+    current_time = time.time()
+    expiry_threshold = current_time - (TASK_EXPIRY_HOURS * 3600)
+    
+    # Remove expired tasks
+    expired = [tid for tid, task in tasks.items() 
+               if task["created_at"] < expiry_threshold]
+    for tid in expired:
+        del tasks[tid]
+        logger.debug(f"Removed expired task: {tid}")
+    
+    # If still too many, remove oldest
+    if len(tasks) > MAX_TASKS:
+        sorted_tasks = sorted(tasks.items(), key=lambda x: x[1]["created_at"])
+        to_remove = len(tasks) - MAX_TASKS
+        for tid, _ in sorted_tasks[:to_remove]:
+            del tasks[tid]
+            logger.debug(f"Removed old task (capacity): {tid}")
+
+# =============================================================================
 # ENUMS & TYPES
 # =============================================================================
 
@@ -116,19 +135,34 @@ class QueryMode(str, Enum):
             "codemap": "codemap"
         }
         return mapping[self.value]
-
-
-class QueryState(str, Enum):
-    """Query execution states."""
-    PENDING = "pending"
-    RUNNING = "running"
-    DONE = "done"
-    FAILED = "failed"
+    
+    @property
+    def estimated_time(self) -> str:
+        """Estimated completion time."""
+        times = {
+            "fast": "5-15 seconds",
+            "deep": "30-90 seconds",
+            "codemap": "20-60 seconds"
+        }
+        return times[self.value]
 
 
 # =============================================================================
 # DATA MODELS
 # =============================================================================
+
+class QueryRequest(BaseModel):
+    """Request payload for query API."""
+    engine_id: str
+    user_query: str
+    keywords: List[str] = Field(default_factory=list)
+    repo_names: List[str]
+    additional_context: str = ""
+    query_id: str
+    use_notes: bool = False
+    attached_context: List[Any] = Field(default_factory=list)
+    generate_summary: bool = True
+
 
 class CodemapLocation(BaseModel):
     """A single location in a code trace."""
@@ -157,28 +191,6 @@ class Codemap(BaseModel):
     workspace_info: Dict[str, Any] = Field(default_factory=dict)
 
 
-class QueryRequest(BaseModel):
-    """Request payload for query API."""
-    engine_id: str
-    user_query: str
-    keywords: List[str] = Field(default_factory=list)
-    repo_names: List[str]
-    additional_context: str = ""
-    query_id: str
-    use_notes: bool = False
-    attached_context: List[Any] = Field(default_factory=list)
-    generate_summary: bool = True
-
-
-class ProgressUpdate(BaseModel):
-    """Progress update for streaming queries."""
-    type: str = "progress"
-    query_id: str
-    message: str
-    timestamp: datetime = Field(default_factory=datetime.now)
-    progress_percent: Optional[int] = None
-
-
 # =============================================================================
 # MERMAID DIAGRAM GENERATOR
 # =============================================================================
@@ -187,14 +199,14 @@ class MermaidGenerator:
     """Generates Mermaid flowcharts from codemaps."""
     
     TRACE_COLORS = [
-        ("#e8f5e9", "#4caf50"),  # green
-        ("#e3f2fd", "#2196f3"),  # blue
-        ("#fff3e0", "#ff9800"),  # orange
-        ("#f3e5f5", "#9c27b0"),  # purple
-        ("#fff8e1", "#ffc107"),  # yellow
-        ("#fce4ec", "#e91e63"),  # pink
-        ("#e0f2f1", "#009688"),  # teal
-        ("#fbe9e7", "#ff5722"),  # deep orange
+        ("#e8f5e9", "#4caf50"),
+        ("#e3f2fd", "#2196f3"),
+        ("#fff3e0", "#ff9800"),
+        ("#f3e5f5", "#9c27b0"),
+        ("#fff8e1", "#ffc107"),
+        ("#fce4ec", "#e91e63"),
+        ("#e0f2f1", "#009688"),
+        ("#fbe9e7", "#ff5722"),
     ]
     
     @staticmethod
@@ -217,7 +229,6 @@ class MermaidGenerator:
         """Generate Mermaid diagram from codemap."""
         lines = ["flowchart TB"]
         
-        # Generate subgraphs for each trace
         for i, trace in enumerate(codemap.traces):
             sg_id = cls.sanitize_id(f"trace_{trace.id}")
             title = cls.escape_label(trace.title)
@@ -225,7 +236,6 @@ class MermaidGenerator:
             lines.append("")
             lines.append(f'    subgraph {sg_id}["{trace.id}. {title}"]')
             
-            # Add locations
             for loc in trace.locations:
                 loc_id = cls.sanitize_id(f"loc_{loc.id}")
                 loc_title = cls.escape_label(loc.title)
@@ -235,13 +245,11 @@ class MermaidGenerator:
             
             lines.append("    end")
             
-            # Connect locations sequentially within trace
             for j in range(len(trace.locations) - 1):
                 a = cls.sanitize_id(f"loc_{trace.locations[j].id}")
                 b = cls.sanitize_id(f"loc_{trace.locations[j + 1].id}")
                 lines.append(f"    {a} --> {b}")
         
-        # Connect traces with dashed lines
         for i in range(len(codemap.traces) - 1):
             curr_locs = codemap.traces[i].locations
             next_locs = codemap.traces[i + 1].locations
@@ -250,7 +258,6 @@ class MermaidGenerator:
                 b = cls.sanitize_id(f"loc_{next_locs[0].id}")
                 lines.append(f"    {a} -.-> {b}")
         
-        # Add styling
         lines.append("")
         for i, trace in enumerate(codemap.traces):
             sg_id = cls.sanitize_id(f"trace_{trace.id}")
@@ -260,12 +267,37 @@ class MermaidGenerator:
         return '\n'.join(lines)
 
 
+def extract_codemap(query_response: Dict[str, Any]) -> Optional[Codemap]:
+    """Extract codemap from query response."""
+    try:
+        queries = query_response.get("queries", [])
+        if not queries:
+            return None
+        
+        response_data = queries[-1].get("response", [])
+        if not response_data:
+            return None
+        
+        for chunk in response_data:
+            if chunk.get("type") == "chunk" and chunk.get("data"):
+                data = chunk["data"]
+                if isinstance(data, str):
+                    data = json.loads(data)
+                if data.get("traces"):
+                    return Codemap(**data)
+        
+        return None
+    except Exception as e:
+        logger.warning(f"Failed to extract codemap: {e}")
+        return None
+
+
 # =============================================================================
 # API CLIENT
 # =============================================================================
 
 class DeepWikiClient:
-    """Async HTTP client for DeepWiki API with retry logic and connection pooling."""
+    """Async HTTP client for DeepWiki API."""
     
     def __init__(self):
         """Initialize the HTTP client."""
@@ -282,15 +314,6 @@ class DeepWikiClient:
         )
         self._client: Optional[httpx.AsyncClient] = None
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_queries)
-    
-    async def __aenter__(self):
-        """Context manager entry."""
-        await self.start()
-        return self
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit."""
-        await self.close()
     
     async def start(self):
         """Start the HTTP client."""
@@ -340,14 +363,14 @@ class DeepWikiClient:
             if e.response.status_code == 429:
                 raise ValueError("Rate limit exceeded. Please try again later.")
             elif e.response.status_code >= 500:
-                raise ValueError(f"Server error ({e.response.status_code}). The service may be temporarily unavailable.")
+                raise ValueError(f"Server error ({e.response.status_code}). Service may be unavailable.")
             elif e.response.status_code == 404:
-                raise ValueError("Resource not found. Check your query ID or repository name.")
+                raise ValueError("Resource not found. Check query ID or repository name.")
             else:
                 raise ValueError(f"Request failed: {e.response.text}")
         except httpx.TimeoutException:
             logger.error("Request timeout")
-            raise ValueError("Request timed out. Try using 'fast' mode or a simpler query.")
+            raise ValueError("Request timed out. Try 'fast' mode or simpler query.")
         except httpx.NetworkError as e:
             logger.error(f"Network error: {e}")
             raise ValueError(f"Network error: {str(e)}")
@@ -368,37 +391,7 @@ class DeepWikiClient:
         logger.debug(f"Checking status for query {query_id}")
         return await self._request("GET", f"/ada/query/{query_id}")
     
-    async def get_repo_status(self, repo_name: str) -> Dict[str, Any]:
-        """Get repository indexing status."""
-        logger.debug(f"Checking status for repo {repo_name}")
-        result = await self._request(
-            "GET",
-            f"/ada/public_repo_indexing_status?repo_name={repo_name}"
-        )
-        return {"repo_name": repo_name, **result}
-    
-    async def list_repos(self, search_term: str) -> Dict[str, Any]:
-        """Search for indexed repositories."""
-        logger.debug(f"Searching repos: {search_term}")
-        return await self._request(
-            "GET",
-            f"/ada/list_public_indexes?search_repo={search_term}"
-        )
-    
-    async def warm_repo(self, repo_name: str) -> Dict[str, Any]:
-        """Pre-warm repository cache."""
-        logger.info(f"Warming repo cache: {repo_name}")
-        result = await self._request(
-            "POST",
-            f"/ada/warm_public_repo?repo_name={repo_name}"
-        )
-        return {"repo_name": repo_name, **result}
-    
-    async def poll_until_done(
-        self,
-        query_id: str,
-        callback: Optional[callable] = None
-    ) -> Dict[str, Any]:
+    async def poll_until_done(self, query_id: str) -> Dict[str, Any]:
         """Poll query status until completion."""
         logger.info(f"Polling query {query_id}...")
         
@@ -412,15 +405,6 @@ class DeepWikiClient:
                 last_query = queries[-1]
                 state = last_query.get("state")
                 
-                # Send progress update
-                if callback:
-                    progress = ProgressUpdate(
-                        query_id=query_id,
-                        message=f"Query status: {state}",
-                        progress_percent=min(95, int((attempt / settings.poll_max_attempts) * 100))
-                    )
-                    await callback(progress)
-                
                 if state == "done":
                     logger.info(f"Query {query_id} completed successfully")
                     return result
@@ -431,64 +415,8 @@ class DeepWikiClient:
         
         timeout_sec = (settings.poll_interval_ms * settings.poll_max_attempts) / 1000
         logger.error(f"Query {query_id} timed out after {timeout_sec}s")
-        raise ValueError(
-            f"Query timed out after {timeout_sec}s. "
-            "Try using 'fast' mode or breaking down your query into smaller parts."
-        )
+        raise ValueError(f"Query timed out after {timeout_sec}s. Try 'fast' mode.")
 
-
-# =============================================================================
-# HELPER FUNCTIONS
-# =============================================================================
-
-def extract_codemap(query_response: Dict[str, Any]) -> Optional[Codemap]:
-    """Extract codemap from query response."""
-    try:
-        queries = query_response.get("queries", [])
-        if not queries:
-            return None
-        
-        response_data = queries[-1].get("response", [])
-        if not response_data:
-            return None
-        
-        for chunk in response_data:
-            if chunk.get("type") == "chunk" and chunk.get("data"):
-                data = chunk["data"]
-                if isinstance(data, str):
-                    data = json.loads(data)
-                if data.get("traces"):
-                    return Codemap(**data)
-        
-        return None
-    except Exception as e:
-        logger.warning(f"Failed to extract codemap: {e}")
-        return None
-
-
-def format_query_result(result: Dict[str, Any], include_mermaid: bool = False) -> Dict[str, Any]:
-    """Format query result for presentation."""
-    formatted = {
-        "query_id": result.get("query_id"),
-        "status": "completed",
-        "queries": result.get("queries", [])
-    }
-    
-    # Extract codemap if requested
-    if include_mermaid:
-        codemap = extract_codemap(result)
-        if codemap:
-            formatted["mermaid_diagram"] = MermaidGenerator.generate(codemap)
-            formatted["codemap"] = codemap.model_dump()
-    
-    return formatted
-
-
-# =============================================================================
-# MCP SERVER
-# =============================================================================
-
-mcp = FastMCP("deepwiki-mcp")
 
 # Global client instance
 _client: Optional[DeepWikiClient] = None
@@ -504,66 +432,27 @@ async def get_client() -> DeepWikiClient:
 
 
 # =============================================================================
-# MCP TOOLS
+# BACKGROUND TASK EXECUTION
 # =============================================================================
 
-@mcp.tool()
-async def deepwiki_query(
-    question: Annotated[str, Field(
-        description="Natural language question about the codebase. Examples: 'How does authentication work?', 'Where is error handling implemented?', 'Show me the data flow for user registration'",
-        min_length=3,
-        max_length=2000
-    )],
-    repos: Annotated[List[str], Field(
-        description="List of GitHub repositories in 'owner/repo' format. Example: ['facebook/react', 'vercel/next.js']. Maximum 5 repositories.",
-        min_length=1,
-        max_length=5
-    )],
-    mode: Annotated[QueryMode, Field(
-        description="Query mode: 'fast' for quick searches (2-5s), 'deep' for thorough analysis (30-60s), 'codemap' for visual flow diagrams (20-40s)"
-    )] = QueryMode.FAST,
-    context: Annotated[Optional[str], Field(
-        description="Additional context to guide the search. Example: 'Focus on React hooks', 'Look at recent changes'"
-    )] = None,
-    generate_summary: Annotated[bool, Field(
-        description="Whether to generate a summary of findings"
-    )] = True,
-    include_mermaid: Annotated[bool, Field(
-        description="Include Mermaid diagram in response (only works with 'codemap' mode)"
-    )] = False
-) -> Dict[str, Any]:
-    """
-    Query code repositories using natural language AI search.
-    
-    This tool searches and analyzes code across GitHub repositories to answer
-    questions about implementation details, architecture, and code patterns.
-    
-    The tool supports three modes:
-    - FAST: Quick searches for finding specific code patterns (recommended for most queries)
-    - DEEP: Thorough analysis with detailed explanations (use for complex architectural questions)
-    - CODEMAP: Generates visual flow diagrams showing code execution paths
-    
-    Returns structured results including code locations, explanations, and 
-    optionally visual Mermaid diagrams (in codemap mode with include_mermaid=True).
-    
-    Examples:
-    - "How does React handle component updates?"
-    - "Where is authentication implemented in Next.js?"
-    - "Show me the data flow for API requests"
-    """
+async def execute_query_background(
+    task_id: str,
+    question: str,
+    repos: List[str],
+    mode: QueryMode,
+    context: Optional[str],
+    generate_summary: bool,
+    include_mermaid: bool
+):
+    """Execute query in background and update task status."""
     try:
+        tasks[task_id]["status"] = "running"
+        logger.info(f"Task {task_id} started (mode: {mode.value})")
+        
         client = await get_client()
         
-        # Validate repositories
-        for repo in repos:
-            if '/' not in repo:
-                return {
-                    "error": f"Invalid repository format: '{repo}'. Use 'owner/repo' format.",
-                    "example": "facebook/react"
-                }
-        
         # Create query request
-        query_id = str(uuid4())
+        query_id = str(uuid.uuid4())
         request = QueryRequest(
             engine_id=mode.engine_id,
             user_query=question,
@@ -577,103 +466,255 @@ async def deepwiki_query(
         await client.submit_query(request)
         
         # Poll for results
-        logger.info(f"Waiting for query {query_id} to complete (mode: {mode.value})...")
         result = await client.poll_until_done(query_id)
         
-        # Format and return
-        return format_query_result(
-            result,
-            include_mermaid=(include_mermaid and mode == QueryMode.CODEMAP)
-        )
+        # Format results
+        formatted = {
+            "query_id": query_id,
+            "status": "completed",
+            "question": question,
+            "repos": repos,
+            "mode": mode.value,
+            "queries": result.get("queries", [])
+        }
         
-    except ValueError as e:
-        logger.error(f"Query failed: {e}")
-        return {
-            "error": str(e),
-            "suggestion": "Try using 'fast' mode or simplifying your query"
-        }
+        # Add Mermaid diagram if requested
+        if include_mermaid and mode == QueryMode.CODEMAP:
+            codemap = extract_codemap(result)
+            if codemap:
+                formatted["mermaid_diagram"] = MermaidGenerator.generate(codemap)
+                formatted["codemap"] = codemap.model_dump()
+        
+        tasks[task_id]["status"] = "completed"
+        tasks[task_id]["result"] = formatted
+        tasks[task_id]["completed_at"] = time.time()
+        
+        elapsed = int(time.time() - tasks[task_id]["created_at"])
+        logger.info(f"Task {task_id} completed in {elapsed}s")
+        
     except Exception as e:
-        logger.error(f"Unexpected error in query: {e}", exc_info=True)
-        return {
-            "error": f"Unexpected error: {str(e)}",
-            "type": type(e).__name__
-        }
+        tasks[task_id]["status"] = "failed"
+        tasks[task_id]["error"] = str(e)
+        tasks[task_id]["completed_at"] = time.time()
+        logger.error(f"Task {task_id} failed: {e}", exc_info=True)
 
+
+# =============================================================================
+# MCP SERVER
+# =============================================================================
+
+mcp = FastMCP("deepwiki-mcp")
+
+
+# =============================================================================
+# MCP TOOLS
+# =============================================================================
 
 @mcp.tool()
-async def deepwiki_get_result(
-    query_id: Annotated[str, Field(
-        description="Query ID from a previous deepwiki_query call",
-        min_length=1
+async def deepwiki_query(
+    question: Annotated[str, Field(
+        description="Natural language question about the codebase. Examples: 'How does authentication work?', 'Show me the data flow for user registration'",
+        min_length=3,
+        max_length=2000
     )],
+    repos: Annotated[List[str], Field(
+        description="List of GitHub repositories in 'owner/repo' format. Example: ['facebook/react', 'vercel/next.js']. Maximum 5 repositories.",
+        min_length=1,
+        max_length=5
+    )],
+    mode: Annotated[QueryMode, Field(
+        description="Query mode: 'fast' (5-15s) for quick searches, 'deep' (30-90s) for thorough analysis, 'codemap' (20-60s) for visual flow diagrams"
+    )] = QueryMode.FAST,
+    context: Annotated[Optional[str], Field(
+        description="Additional context to guide the search. Example: 'Focus on React hooks', 'Look at recent changes'"
+    )] = None,
+    generate_summary: Annotated[bool, Field(
+        description="Whether to generate a summary of findings"
+    )] = True,
     include_mermaid: Annotated[bool, Field(
-        description="Include Mermaid diagram if available (for codemap queries)"
+        description="Include Mermaid diagram in response (only works with 'codemap' mode)"
     )] = False
-) -> Dict[str, Any]:
+) -> str:
     """
-    Retrieve results from a previous query.
+    Query code repositories using natural language AI search.
     
-    Use this to fetch results from a query that was already submitted,
-    or to check the status of a long-running query.
+    This tool searches and analyzes code across GitHub repositories. It returns
+    a TASK ID immediately and executes the query in the background.
     
-    Returns the same format as deepwiki_query.
+    ASYNC EXECUTION:
+    - Query is submitted and runs in background
+    - Returns task_id immediately (no waiting)
+    - Use deepwiki_check_task(task_id) to retrieve results
+    
+    MODES:
+    - FAST (5-15s): Quick searches for specific code patterns
+    - DEEP (30-90s): Thorough analysis with detailed explanations  
+    - CODEMAP (20-60s): Visual flow diagrams showing code execution
+    
+    WORKFLOW:
+    1. Call this tool → Get task_id
+    2. Tell user "Query running in background, will take ~X seconds"
+    3. WAIT for user's next message (don't auto-check)
+    4. When user responds, use deepwiki_check_task(task_id)
+    
+    Returns:
+        Task ID for async retrieval. Use deepwiki_check_task to get results.
     """
     try:
-        client = await get_client()
-        result = await client.get_query_status(query_id)
+        # Validate repositories
+        for repo in repos:
+            if '/' not in repo:
+                return f"Error: Invalid repository format '{repo}'. Use 'owner/repo' format (e.g., 'facebook/react')."
         
-        # Check if query is done
-        queries = result.get("queries", [])
-        if queries:
-            state = queries[-1].get("state")
-            if state != "done":
-                return {
-                    "query_id": query_id,
-                    "status": state,
-                    "message": f"Query is still {state}. Please try again in a few seconds."
-                }
+        # Cleanup old tasks
+        cleanup_old_tasks()
         
-        return format_query_result(result, include_mermaid=include_mermaid)
+        # Create new task
+        task_id = f"deepwiki_{uuid.uuid4().hex[:8]}"
+        tasks[task_id] = {
+            "status": "pending",
+            "created_at": time.time(),
+            "completed_at": None,
+            "result": None,
+            "error": None,
+            "question": question[:200],
+            "repos": repos,
+            "mode": mode.value
+        }
         
-    except ValueError as e:
-        return {"error": str(e)}
+        # Start background execution
+        asyncio.create_task(execute_query_background(
+            task_id, question, repos, mode, context, generate_summary, include_mermaid
+        ))
+        
+        logger.info(f"Task {task_id} created for query: {question[:50]}...")
+        
+        return f"""Task started: {task_id}
+
+Query: {question}
+Repositories: {', '.join(repos)}
+Mode: {mode.value} (estimated time: {mode.estimated_time})
+
+CRITICAL INSTRUCTION: Return control to the user immediately. Inform them that the code search is running in the background and will take approximately {mode.estimated_time} to complete. Wait for their next message before checking the results.
+
+When the user responds again, use deepwiki_check_task tool with '{task_id}' as task_id to retrieve the results."""
+        
     except Exception as e:
-        logger.error(f"Error retrieving query: {e}", exc_info=True)
-        return {"error": f"Failed to retrieve query: {str(e)}"}
+        logger.error(f"Error creating task: {e}", exc_info=True)
+        return f"Error: Failed to create query task: {str(e)}"
 
 
 @mcp.tool()
-async def deepwiki_repo_status(
-    repo: Annotated[str, Field(
-        description="Repository name in 'owner/repo' format (e.g., 'facebook/react')",
+async def deepwiki_check_task(
+    task_id: Annotated[str, Field(
+        description="Task identifier from deepwiki_query",
         min_length=1
     )]
-) -> Dict[str, Any]:
+) -> str:
     """
-    Check if a repository is indexed and ready for querying.
+    Check status and retrieve results of a DeepWiki query task.
     
-    Before querying a repository, you can use this tool to verify it's
-    available in the DeepWiki index. If it's not indexed, you may need
-    to use deepwiki_warm_repo first.
+    When deepwiki_query() is called, it returns a task_id. Use this tool to
+    check if the query is complete and get the results.
     
-    Returns indexing status and metadata about the repository.
+    RETURNS:
+    - "Status: pending" → Task queued, not started yet
+    - "Status: running (X seconds)" → Query in progress
+    - Full results → Query completed (includes all findings, code locations, etc.)
+    - "Status: failed - [error]" → Query failed with error message
+    - "Status: not_found" → Invalid/expired task_id
+    
+    WORKFLOW:
+    1. deepwiki_query(question, repos) → Returns task_id
+    2. Wait based on mode (fast: 15s, deep: 60s, codemap: 30s)
+    3. deepwiki_check_task(task_id) → Check status
+    4. If completed: Full results returned
+    5. If running: Wait and check again when user next interacts
+    
+    TASK RETENTION:
+    - Tasks kept for 24 hours
+    - Maximum 100 tasks stored
+    - Older tasks auto-deleted when limit reached
+    
+    Args:
+        task_id: Task identifier from deepwiki_query()
+        
+    Returns:
+        Status update or full query results when completed
     """
-    try:
-        if '/' not in repo:
-            return {
-                "error": f"Invalid repository format: '{repo}'",
-                "expected_format": "owner/repo",
-                "example": "facebook/react"
-            }
+    
+    cleanup_old_tasks()
+    
+    if task_id not in tasks:
+        return f"Status: not_found - Task '{task_id}' does not exist or has expired (tasks kept 24 hours, max 100 tasks stored)."
+    
+    task = tasks[task_id]
+    status = task["status"]
+    
+    if status == "pending":
+        elapsed = int(time.time() - task["created_at"])
+        return f"""Task pending ({elapsed} seconds elapsed).
+
+The task is queued and will begin processing shortly. Queries typically complete in their estimated time based on mode. Return control to the user and inform them the task is initializing. Check status again when the user next interacts with you."""
+    
+    elif status == "running":
+        elapsed = int(time.time() - task["created_at"])
+        mode = task.get("mode", "unknown")
+        estimated_times = {
+            "fast": "5-15 seconds",
+            "deep": "30-90 seconds",
+            "codemap": "20-60 seconds"
+        }
+        estimated = estimated_times.get(mode, "30-60 seconds")
         
-        client = await get_client()
-        return await client.get_repo_status(repo)
+        return f"""Task still running ({elapsed} seconds elapsed).
+
+Mode: {mode} (estimated time: {estimated})
+Question: {task['question']}
+Repositories: {', '.join(task['repos'])}
+
+The query is actively searching and analyzing code. Return control to the user and inform them the task is still in progress. Check status again when the user next interacts with you."""
+    
+    elif status == "completed":
+        result = task["result"]
         
-    except ValueError as e:
-        return {"error": str(e)}
-    except Exception as e:
-        logger.error(f"Error checking repo status: {e}", exc_info=True)
-        return {"error": f"Failed to check repository status: {str(e)}"}
+        # Format the response nicely
+        response = f"""✅ Query Completed Successfully
+
+**Question:** {result['question']}
+**Repositories:** {', '.join(result['repos'])}
+**Mode:** {result['mode']}
+
+---
+
+**Results:**
+
+"""
+        # Add the actual query results
+        response += json.dumps(result, indent=2)
+        
+        return response
+    
+    elif status == "failed":
+        elapsed = int(time.time() - task["created_at"])
+        return f"""Status: failed ({elapsed} seconds elapsed)
+
+Error: {task['error']}
+
+The query encountered an error. This might be due to:
+- Repository not indexed
+- Network issues
+- Invalid query parameters
+- API timeout
+
+Try:
+- Using 'fast' mode instead of 'deep'
+- Simplifying your question
+- Checking if the repository exists and is public
+- Trying again in a moment"""
+    
+    else:
+        return f"Status: unknown - Unexpected task state: {status}"
 
 
 @mcp.tool()
@@ -683,80 +724,54 @@ async def deepwiki_search_repos(
         min_length=1,
         max_length=100
     )]
-) -> Dict[str, Any]:
+) -> str:
     """
     Search for indexed repositories available for querying.
     
     Use this to discover which repositories are available in the DeepWiki
-    index. Useful for finding repositories related to your topic of interest.
+    index before querying them. Helps prevent errors from querying
+    non-indexed repositories.
     
-    Returns a list of matching repositories with metadata.
+    Args:
+        search: Search term for repositories
+        
+    Returns:
+        List of matching repositories with metadata
     """
     try:
         client = await get_client()
-        result = await client.list_repos(search)
         
-        # Add helpful metadata
+        result = await client._request(
+            "GET",
+            f"/ada/list_public_indexes?search_repo={search}"
+        )
+        
         repos_found = result.get("repositories", [])
-        return {
-            "search_term": search,
-            "count": len(repos_found),
-            "repositories": repos_found
-        }
         
-    except ValueError as e:
-        return {"error": str(e)}
+        if not repos_found:
+            return f"""No repositories found matching '{search}'.
+
+Try:
+- Broader search terms (e.g., 'react' instead of 'react-dom')
+- Popular repository names
+- Framework or library names"""
+        
+        response = f"""Found {len(repos_found)} repositories matching '{search}':
+
+"""
+        for repo in repos_found[:10]:  # Limit to first 10
+            name = repo.get("name", "unknown")
+            description = repo.get("description", "No description")
+            response += f"- **{name}**: {description}\n"
+        
+        if len(repos_found) > 10:
+            response += f"\n... and {len(repos_found) - 10} more repositories."
+        
+        return response
+        
     except Exception as e:
         logger.error(f"Error searching repos: {e}", exc_info=True)
-        return {"error": f"Failed to search repositories: {str(e)}"}
-
-
-@mcp.tool()
-async def deepwiki_warm_repo(
-    repo: Annotated[str, Field(
-        description="Repository name in 'owner/repo' format to pre-warm in the cache",
-        min_length=1
-    )]
-) -> Dict[str, Any]:
-    """
-    Pre-warm a repository's cache for faster queries.
-    
-    If you're planning to make multiple queries against a repository,
-    use this tool first to ensure it's loaded and ready. This can
-    significantly improve query response times.
-    
-    Returns confirmation of cache warming status.
-    """
-    try:
-        if '/' not in repo:
-            return {
-                "error": f"Invalid repository format: '{repo}'",
-                "expected_format": "owner/repo",
-                "example": "facebook/react"
-            }
-        
-        client = await get_client()
-        result = await client.warm_repo(repo)
-        
-        return {
-            **result,
-            "message": f"Repository '{repo}' cache warmed successfully",
-            "next_step": "You can now query this repository with deepwiki_query"
-        }
-        
-    except ValueError as e:
-        return {"error": str(e)}
-    except Exception as e:
-        logger.error(f"Error warming repo: {e}", exc_info=True)
-        return {"error": f"Failed to warm repository: {str(e)}"}
-
-
-# =============================================================================
-# SERVER LIFECYCLE
-# =============================================================================
-
-# Note: FastMCP doesn't have on_shutdown hook
-# Cleanup is handled automatically by DeepWikiClient context manager
+        return f"Error: Failed to search repositories: {str(e)}"
 
 
 # =============================================================================
@@ -766,12 +781,13 @@ async def deepwiki_warm_repo(
 def main():
     """Main entry point for the MCP server."""
     logger.info("=" * 70)
-    logger.info("DeepWiki MCP Server - Production Grade")
+    logger.info("DeepWiki MCP Server - Async Task-Based Architecture")
     logger.info("=" * 70)
     logger.info(f"API URL: {settings.deepwiki_api_url}")
     logger.info(f"Max concurrent queries: {settings.max_concurrent_queries}")
     logger.info(f"Poll interval: {settings.poll_interval_ms}ms")
     logger.info(f"Log level: {settings.log_level}")
+    logger.info(f"Task retention: {TASK_EXPIRY_HOURS}h, max {MAX_TASKS} tasks")
     logger.info("=" * 70)
     
     # Run the server
