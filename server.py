@@ -488,7 +488,7 @@ def format_query_result(result: Dict[str, Any], include_mermaid: bool = False) -
 # MCP SERVER
 # =============================================================================
 
-mcp = FastMCP("deepwiki-mcp", dependencies=["httpx", "tenacity", "pydantic-settings"])
+mcp = FastMCP("deepwiki-mcp")
 
 # Global client instance
 _client: Optional[DeepWikiClient] = None
