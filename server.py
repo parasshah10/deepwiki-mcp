@@ -297,11 +297,11 @@ def _extract_answer_from_response(result: Dict[str, Any]) -> str:
     Extract clean answer text from the verbose API response.
     
     The API returns data in multiple formats:
-    - "chunk" entries contain the main answer text
-    - "summary_chunk" entries build up the final summary
+    - "chunk" entries contain the main detailed answer
+    - "summary_chunk" entries build up a condensed summary
     - "file_contents" and "reference" entries are metadata we don't need
     
-    This function extracts just the human-readable answer.
+    This function extracts the detailed answer, not just the summary.
     """
     queries = result.get("queries", [])
     if not queries:
@@ -311,29 +311,35 @@ def _extract_answer_from_response(result: Dict[str, Any]) -> str:
     if not response_data:
         return "No response data available."
     
-    # Collect all the text chunks (these contain the actual answer)
-    text_chunks = []
-    summary_chunks = []
+    # Collect meaningful text chunks (the detailed answer)
+    answer_chunks = []
     
     for item in response_data:
         item_type = item.get("type")
         data = item.get("data")
         
-        # Main answer chunks
+        # Main answer chunks - these contain the detailed response
         if item_type == "chunk" and isinstance(data, str):
-            # Skip metadata chunks
-            if not data.startswith(">") and not data.strip().startswith("I'll"):
-                text_chunks.append(data)
-        
-        # Summary chunks (final condensed answer)
-        elif item_type == "summary_chunk" and isinstance(data, str):
-            summary_chunks.append(data)
+            # Skip progress indicators (lines starting with >)
+            # Skip AI thinking aloud ("I'll help you...", "Let me search...")
+            trimmed = data.strip()
+            if trimmed and not trimmed.startswith(">"):
+                # Skip the "I'll help" preambles but keep the actual content
+                if not any(trimmed.startswith(prefix) for prefix in [
+                    "I'll help", 
+                    "Let me search",
+                    "I'll search",
+                    "> Searching"
+                ]):
+                    answer_chunks.append(data)
     
-    # Prefer summary if available, otherwise use text chunks
-    if summary_chunks:
-        return "".join(summary_chunks).strip()
-    elif text_chunks:
-        return "\n".join(text_chunks).strip()
+    if answer_chunks:
+        # Join all chunks and clean up excessive newlines
+        full_answer = "".join(answer_chunks)
+        # Normalize multiple newlines to at most 2
+        import re
+        full_answer = re.sub(r'\n{3,}', '\n\n', full_answer)
+        return full_answer.strip()
     else:
         return "Response received but no readable text found."
 
