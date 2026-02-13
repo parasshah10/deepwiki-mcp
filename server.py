@@ -292,6 +292,52 @@ def extract_codemap(query_response: Dict[str, Any]) -> Optional[Codemap]:
         return None
 
 
+def _extract_answer_from_response(result: Dict[str, Any]) -> str:
+    """
+    Extract clean answer text from the verbose API response.
+    
+    The API returns data in multiple formats:
+    - "chunk" entries contain the main answer text
+    - "summary_chunk" entries build up the final summary
+    - "file_contents" and "reference" entries are metadata we don't need
+    
+    This function extracts just the human-readable answer.
+    """
+    queries = result.get("queries", [])
+    if not queries:
+        return "No response data available."
+    
+    response_data = queries[-1].get("response", [])
+    if not response_data:
+        return "No response data available."
+    
+    # Collect all the text chunks (these contain the actual answer)
+    text_chunks = []
+    summary_chunks = []
+    
+    for item in response_data:
+        item_type = item.get("type")
+        data = item.get("data")
+        
+        # Main answer chunks
+        if item_type == "chunk" and isinstance(data, str):
+            # Skip metadata chunks
+            if not data.startswith(">") and not data.strip().startswith("I'll"):
+                text_chunks.append(data)
+        
+        # Summary chunks (final condensed answer)
+        elif item_type == "summary_chunk" and isinstance(data, str):
+            summary_chunks.append(data)
+    
+    # Prefer summary if available, otherwise use text chunks
+    if summary_chunks:
+        return "".join(summary_chunks).strip()
+    elif text_chunks:
+        return "\n".join(text_chunks).strip()
+    else:
+        return "Response received but no readable text found."
+
+
 # =============================================================================
 # API CLIENT
 # =============================================================================
@@ -678,6 +724,9 @@ The query is actively searching and analyzing code. Return control to the user a
     elif status == "completed":
         result = task["result"]
         
+        # Extract the clean answer from the verbose API response
+        answer_text = _extract_answer_from_response(result)
+        
         # Format the response nicely
         response = f"""✅ Query Completed Successfully
 
@@ -687,11 +736,10 @@ The query is actively searching and analyzing code. Return control to the user a
 
 ---
 
-**Results:**
+**Answer:**
 
+{answer_text}
 """
-        # Add the actual query results
-        response += json.dumps(result, indent=2)
         
         return response
     
