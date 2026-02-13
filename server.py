@@ -25,7 +25,7 @@ from uuid import uuid4
 import httpx
 from fastmcp import FastMCP
 from pydantic import BaseModel, Field, field_validator
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -78,9 +78,10 @@ class Settings(BaseSettings):
         description="Logging level (DEBUG, INFO, WARNING, ERROR)"
     )
     
-    class Config:
-        env_file = ".env"
-        env_prefix = "DEEPWIKI_"
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_prefix="DEEPWIKI_"
+    )
 
 
 settings = Settings()
